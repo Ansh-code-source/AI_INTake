@@ -34,6 +34,45 @@ class IntakeConfig(BaseModel):
 
     class Config:
         extra = "forbid"
+    def start_expert_eval(self):
+        if self.config.template != "expert_eval":
+            raise RuntimeError("start_expert_eval only valid for expert_eval")
+
+        if self._router is None:
+            self._router = Router()
+
+        engine = self._router.route(self.config)
+        if self._llm:
+            engine.llm = self._llm
+
+        session = ExpertEvalSession(self.config.persona, self.config.problem)
+        first = engine.start_expert_eval()
+        session.add_bot(first["reply"])
+        return session, first["reply"]
+    def chat(self, session, user_input: str):
+        if self._router is None:
+            self._router = Router()
+
+        engine = self._router.route(self.config)
+        if self._llm:
+            engine.llm = self._llm
+
+        session.add_user(user_input)
+        reply = engine.chat_expert_eval(session, user_input)
+        session.add_bot(reply["reply"])
+        return reply["reply"]
+    def evaluate(self, session):
+        if self._router is None:
+            self._router = Router()
+
+        engine = self._router.route(self.config)
+        if self._llm:
+            engine.llm = self._llm
+
+        return engine.evaluate_expert_eval(session)
+
+
+
 
 
 class OutputContract(BaseModel):

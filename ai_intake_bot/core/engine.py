@@ -46,112 +46,220 @@ class OutputContract(BaseModel):
 
 
 class PersonaEngine:
-    """Persona-mode engine: assemble prompts, call LLM, parse output."""
+    """
+    Persona-mode engine.
+
+    - Non-expert templates: single-turn via run()
+    - expert_eval: multi-turn via session APIs
+    """
 
     def __init__(self, config: IntakeConfig, llm: Optional[BaseLLM] = None):
         self.config = config
         self.llm = llm or FakeLLM()
-        # Validate persona exists
+
         if self.config.persona not in PERSONAS:
             raise ValueError(f"Unknown persona: {self.config.persona}")
 
-    def run(self, user_input: str) -> Dict[str, Any]:
-        if not isinstance(user_input, str) or not user_input.strip():
-            raise ValueError("user_input must be a non-empty string")
+    # ------------------------------------------------------------------
+    # expert_eval (MULTI-TURN)
+    # ------------------------------------------------------------------
+
+    def start_expert_eval(self) -> Dict[str, Any]:
+        if self.config.template != "expert_eval":
+            raise ValueError("start_expert_eval only valid for expert_eval")
 
         base = compose_base_system_prompt(self.config.extra_system_prompt)
         persona_prompt = compose_persona_role_prompt(
-            self.config.persona, PERSONAS[self.config.persona]
+            self.config.persona,
+            PERSONAS[self.config.persona],
         )
-        problem_prompt = ""
-        if self.config.template == "expert_eval" and self.config.problem:
-            problem_prompt = compose_problem_scenario_prompt(self.config.problem)
+        problem_prompt = compose_problem_scenario_prompt(self.config.problem)
+
+        prompt = f"""
+{base}
+
+{persona_prompt}
+
+{problem_prompt}
+
+You are the USER with this problem.
+Start the conversation naturally.
+Do NOT evaluate the other person.
+
+Respond with JSON:
+{{ "reply": "<text>" }}
+"""
+
+        raw = self.llm.generate(prompt)
+        return self._safe_json_reply(raw)
+
+    def chat_expert_eval(self, session, user_input: str) -> Dict[str, Any]:
+        history = "\n".join(
+            f"{m['role'].capitalize()}: {m['text']}"
+            for m in session.history
+        )
+
+        persona_prompt = compose_persona_role_prompt(
+            self.config.persona,
+            PERSONAS[self.config.persona],
+        )
+        problem_prompt = compose_problem_scenario_prompt(self.config.problem)
+
+        prompt = f"""
+{persona_prompt}
+
+{problem_prompt}
+
+Conversation so far:
+{history}
+
+Expert: {user_input}
+
+Respond as the USER.
+React emotionally and naturally.
+Do NOT evaluate.
+
+Respond with JSON:
+{{ "reply": "<text>" }}
+"""
+
+        raw = self.llm.generate(prompt)
+        return self._safe_json_reply(raw)
+
+    def evaluate_expert_eval(self, session) -> Dict[str, Any]:
+        from .prompts import compose_evaluation_prompt
+        from .scoring import EXPECTED_SIGNALS, compute_score, apply_selection
+        from .actions import detect_actions
+
+        conversation = "\n".join(
+            f"{m['role'].capitalize()}: {m['text']}"
+            for m in session.history
+        )
+
+        eval_prompt = compose_evaluation_prompt(
+            title="Evaluate expert performance",
+            instructions=f"""
+Conversation:
+{conversation}
+
+Evaluate the EXPERT based on:
+- Empathy
+- Clarity
+- Emotional awareness
+- Listening behavior
+- Problem-solving approach
+
+Extract numeric signals for:
+{list(EXPECTED_SIGNALS)}
+
+Return JSON only.
+""",
+        )
+
+        raw = self.llm.generate(eval_prompt)
+        parsed = self._safe_json(raw)
+
+        signals = parsed.get("signals", {}) or {}
+        numeric_signals = {
+            k: float(v)
+            for k, v in signals.items()
+            if isinstance(v, (int, float, str))
+        }
+
+        candidate_score = parsed.get("candidate_score")
+        if candidate_score is None:
+            candidate_score = compute_score(numeric_signals)
+
+        recommended_selection = None
+        if self.config.selection_probability is not None:
+            recommended_selection = apply_selection(
+                candidate_score,
+                self.config.selection_probability,
+            )
+
+        parsed["candidate_score"] = candidate_score
+        parsed["recommended_selection"] = recommended_selection
+        parsed["recommended_actions"] = detect_actions(parsed)
+
+        contract = OutputContract(**{**OutputContract().dict(), **parsed})
+        return contract.dict()
+
+    # ------------------------------------------------------------------
+    # NON-expert templates (SINGLE-TURN)
+    # ------------------------------------------------------------------
+
+    def run(self, user_input: str) -> Dict[str, Any]:
+        if self.config.template == "expert_eval":
+            raise RuntimeError(
+                "expert_eval must be used via start_expert_eval / chat / evaluate"
+            )
+
+        base = compose_base_system_prompt(self.config.extra_system_prompt)
+        persona_prompt = compose_persona_role_prompt(
+            self.config.persona,
+            PERSONAS[self.config.persona],
+        )
         template_prompt = compose_template_prompt(self.config.template)
 
-        # If template requests scoring, ask the model to provide signal scores (0-1)
-        scoring_prompt = ""
-        if self.config.template:
-            from .templates import get_template
+        final_prompt = f"""
+{base}
 
-            tpl = get_template(self.config.template)
-            if tpl.get("scoring"):
-                from .prompts import compose_scoring_prompt
-                from .scoring import EXPECTED_SIGNALS
+{persona_prompt}
 
-                scoring_prompt = compose_scoring_prompt(list(EXPECTED_SIGNALS))
+{template_prompt}
 
-        # For expert_eval, perform a role-play call and then a separate evaluation call.
-        if self.config.template == "expert_eval":
-            # Role-play call (persona role only, no evaluation instructions)
-            roleplay_prompt = (
-                f"{base}\n\n{persona_prompt}\n\n{problem_prompt}\n\n{template_prompt}\n\n"
-                f"User: {user_input}\n\nRespond with valid JSON matching the output contract:"
-            )
-            raw_role = self.llm.generate(roleplay_prompt)
-            try:
-                parsed_role = json.loads(raw_role)
-            except Exception:
-                parsed_role = {"reply": raw_role}
+User: {user_input}
 
-            # Now evaluation call: pass candidate's reply and ask the evaluator to score and recommend actions.
-            from .prompts import compose_evaluation_prompt
+Respond with JSON matching the output contract.
+"""
 
-            candidate_text = parsed_role.get("reply", "")
-            eval_prompt = compose_evaluation_prompt(
-                "Evaluate the candidate response",
-                instructions=(f"Candidate reply: {candidate_text}\n\n" + (scoring_prompt or "")),
-            )
-            raw_eval = self.llm.generate(eval_prompt)
-            try:
-                parsed_eval = json.loads(raw_eval)
-            except Exception:
-                parsed_eval = {}
+        raw = self.llm.generate(final_prompt)
+        parsed = self._safe_json(raw)
 
-            # Merge roleplay (content) with evaluation (signals/actions/score)
-            merged = {**parsed_role, **parsed_eval}
-            parsed = merged
-        else:
-            # Non-expert templates: single call. Include scoring prompt inline if present.
-            final_prompt = (
-                f"{base}\n\n{persona_prompt}\n\n{problem_prompt}\n\n{template_prompt}\n\n"
-                f"{scoring_prompt}\n\nUser: {user_input}\n\nRespond with valid JSON matching the output contract:"
-            )
-            raw = self.llm.generate(final_prompt)
-            try:
-                parsed = json.loads(raw)
-            except Exception:
-                parsed = {"reply": raw}
-
-        # Compute signals, score, selection, and recommended actions
         from .scoring import compute_score, apply_selection
         from .actions import detect_actions
 
         signals = parsed.get("signals", {}) or {}
-        parsed_signals = {}
-        for k, v in signals.items():
-            try:
-                parsed_signals[k] = float(v)
-            except Exception:
-                # ignore non-numeric signals
-                continue
+        numeric_signals = {
+            k: float(v)
+            for k, v in signals.items()
+            if isinstance(v, (int, float, str))
+        }
 
         candidate_score = parsed.get("candidate_score")
         if candidate_score is None:
-            candidate_score = compute_score(parsed_signals)
+            candidate_score = compute_score(numeric_signals)
 
         recommended_selection = None
         if self.config.selection_probability is not None:
-            recommended_selection = apply_selection(candidate_score, self.config.selection_probability)
+            recommended_selection = apply_selection(
+                candidate_score,
+                self.config.selection_probability,
+            )
 
-        parsed.setdefault("candidate_score", candidate_score)
-        parsed.setdefault("recommended_selection", recommended_selection)
+        parsed["candidate_score"] = candidate_score
+        parsed["recommended_selection"] = recommended_selection
+        parsed["recommended_actions"] = detect_actions(parsed)
 
-        recommended_actions = detect_actions(parsed)
-        parsed.setdefault("recommended_actions", recommended_actions)
-
-        # Ensure contract fields exist (fill missing ones with defaults)
         contract = OutputContract(**{**OutputContract().dict(), **parsed})
         return contract.dict()
+
+    # ------------------------------------------------------------------
+    # helpers
+    # ------------------------------------------------------------------
+
+    def _safe_json_reply(self, raw: str) -> Dict[str, Any]:
+        try:
+            data = json.loads(raw)
+            return {"reply": data.get("reply", "")}
+        except Exception:
+            return {"reply": raw}
+
+    def _safe_json(self, raw: str) -> Dict[str, Any]:
+        try:
+            return json.loads(raw)
+        except Exception:
+            return {}
 
 
 class RAGEngine:

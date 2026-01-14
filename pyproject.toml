@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ai_intake_bot"
-version = "0.1.0"
-description = "Persona- and RAG-based intake SDK (prototype)"
+version = "0.1.1"
+description = "Persona-(session) and RAG-based intake SDK (prototype)"
 readme = {file = "README.md", content-type = "text/markdown"}
 license = "MIT"
 license-files = ["LICENSE"]

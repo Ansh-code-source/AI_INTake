@@ -7,7 +7,8 @@ name = "ai_intake_bot"
 version = "0.1.0"
 description = "Persona- and RAG-based intake SDK (prototype)"
 readme = {file = "README.md", content-type = "text/markdown"}
-license = { text = "MIT" }
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.9"
 dependencies = [
   "pydantic>=1.10,<2",

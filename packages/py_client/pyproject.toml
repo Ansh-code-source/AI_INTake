@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "py-client"
+version = "0.1.0"
+description = "Small Python helper package for testing"
+authors = [{name = "AI Intake Bot", email = "dev@example.com"}]
+readme = "README.md"
+requires-python = ">=3.8"
+license = {text = "MIT"}
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0"]

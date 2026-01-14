@@ -5,6 +5,8 @@ for deterministic tests. Real LLM integration (LangChain) will be added later.
 """
 from typing import Optional, List, Dict, Any
 import json
+from .session import ExpertEvalSession
+from .llm_registry import create_llm
 
 from pydantic import BaseModel, ValidationError, Field
 
@@ -34,43 +36,7 @@ class IntakeConfig(BaseModel):
 
     class Config:
         extra = "forbid"
-    def start_expert_eval(self):
-        if self.config.template != "expert_eval":
-            raise RuntimeError("start_expert_eval only valid for expert_eval")
-
-        if self._router is None:
-            self._router = Router()
-
-        engine = self._router.route(self.config)
-        if self._llm:
-            engine.llm = self._llm
-
-        session = ExpertEvalSession(self.config.persona, self.config.problem)
-        first = engine.start_expert_eval()
-        session.add_bot(first["reply"])
-        return session, first["reply"]
-    def chat(self, session, user_input: str):
-        if self._router is None:
-            self._router = Router()
-
-        engine = self._router.route(self.config)
-        if self._llm:
-            engine.llm = self._llm
-
-        session.add_user(user_input)
-        reply = engine.chat_expert_eval(session, user_input)
-        session.add_bot(reply["reply"])
-        return reply["reply"]
-    def evaluate(self, session):
-        if self._router is None:
-            self._router = Router()
-
-        engine = self._router.route(self.config)
-        if self._llm:
-            engine.llm = self._llm
-
-        return engine.evaluate_expert_eval(session)
-
+    
 
 
 
@@ -176,23 +142,49 @@ Respond with JSON:
         )
 
         eval_prompt = compose_evaluation_prompt(
-            title="Evaluate expert performance",
+            evaluation_task="Evaluate the USER in the conversation below.",
             instructions=f"""
-Conversation:
-{conversation}
+    You are an evaluator.
 
-Evaluate the EXPERT based on:
-- Empathy
-- Clarity
-- Emotional awareness
-- Listening behavior
-- Problem-solving approach
+    ROLE DEFINITIONS (IMPORTANT):
+    - USER = the human participant being evaluated.
+    - BOT = the simulated persona/problem-holder.
+    - ONLY evaluate messages spoken by USER.
+    - Do NOT evaluate BOT responses.
 
-Extract numeric signals for:
-{list(EXPECTED_SIGNALS)}
+    Conversation transcript:
+    ------------------------
+    {conversation}
+    ------------------------
 
-Return JSON only.
-""",
+    Evaluate the USER on the following signals.
+    Each signal must be a number between 0 and 1.
+
+    Signals:
+    - empathy (understanding and emotional awareness)
+    - clarity (clear communication and intent)
+    - aggression (hostility or impatience; higher is worse)
+    - urgency (sense of priority or seriousness)
+
+    Return STRICT JSON in the following format ONLY:
+
+    {{
+    "signals": {{
+        "empathy": 0.0,
+        "clarity": 0.0,
+        "aggression": 0.0,
+        "urgency": 0.0
+    }},
+    "structured_data": {{
+        "summary": "One sentence summary of USER behavior"
+    }}
+    }}
+
+    RULES:
+    - Do NOT include prose outside JSON.
+    - Do NOT explain your reasoning.
+    - Do NOT evaluate the BOT.
+    """
         )
 
         raw = self.llm.generate(eval_prompt)
@@ -205,9 +197,7 @@ Return JSON only.
             if isinstance(v, (int, float, str))
         }
 
-        candidate_score = parsed.get("candidate_score")
-        if candidate_score is None:
-            candidate_score = compute_score(numeric_signals)
+        candidate_score = compute_score(numeric_signals)
 
         recommended_selection = None
         if self.config.selection_probability is not None:
@@ -447,6 +437,52 @@ class IntakeBot:
         self._router: Optional[Router] = None
         self._llm: Optional[BaseLLM] = None
         self._voice = None
+    def start_expert_eval(self):
+        if self.config.template != "expert_eval":
+            raise RuntimeError("start_expert_eval only valid for expert_eval")
+
+        if self._router is None:
+            self._router = Router()
+
+        engine = self._router.route(self.config)
+        if self._llm:
+            engine.llm = self._llm
+
+        session = ExpertEvalSession(self.config.persona, self.config.problem)
+        first = engine.start_expert_eval()
+        session.add_bot(first["reply"])
+        return session, first["reply"]
+    
+    def set_llm_by_name(self, provider: str, **kwargs):
+        """
+        Example:
+        bot.set_llm_by_name("openai", model="gpt-4o")
+        bot.set_llm_by_name("gemini", model="gemini-1.5-flash")
+        bot.set_llm_by_name("fake")
+        """
+        self._llm = create_llm(provider, **kwargs)
+    
+    def chat(self, session, user_input: str):
+        if self._router is None:
+            self._router = Router()
+
+        engine = self._router.route(self.config)
+        if self._llm:
+            engine.llm = self._llm
+
+        session.add_user(user_input)
+        reply = engine.chat_expert_eval(session, user_input)
+        session.add_bot(reply["reply"])
+        return reply["reply"]
+    def evaluate(self, session):
+        if self._router is None:
+            self._router = Router()
+
+        engine = self._router.route(self.config)
+        if self._llm:
+            engine.llm = self._llm
+
+        return engine.evaluate_expert_eval(session)
 
     def set_voice(self, voice):
         """Opt-in: set a voice adapter (duck-typed) for spoken replies.
